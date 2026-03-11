@@ -1,6 +1,6 @@
 # Secure Communications & Encrypted Messaging
 
-**Course project** | ENSIBS — Nov.–Dec. 2025 | Python, Flask
+**Course project** | école d'ingénieurs — Nov.–Dec. 2025 | Python, Flask
 
 ## Overview
 
