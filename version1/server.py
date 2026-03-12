@@ -1,4 +1,4 @@
-# TP02 - Secure Messaging Server
+# Secure Messaging Server
 
 from flask import Flask, request, jsonify
 from Crypto.PublicKey import RSA
