@@ -1,0 +1,283 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{parskip}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{amsmath}
+\usepackage{textcomp}   % FIX: needed for \textperiodcentered and safe symbol mapping
+
+\geometry{margin=2.5cm}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\definecolor{codebg}{HTML}{1a1d27}
+\definecolor{codefg}{HTML}{e2e8f0}
+\definecolor{codecomment}{HTML}{94a3b8}
+\definecolor{codestring}{HTML}{f59e0b}
+\definecolor{codekw}{HTML}{4f7ef8}
+
+\lstset{
+    basicstyle=\ttfamily\small\color{codefg},
+    backgroundcolor=\color{codebg},
+    frame=single,
+    rulecolor=\color{codebg},
+    breaklines=true,
+    keywordstyle=\color{codekw}\bfseries,
+    commentstyle=\color{codecomment}\itshape,
+    stringstyle=\color{codestring},
+    language=Python,
+    showstringspaces=false,
+    xleftmargin=6pt, xrightmargin=6pt,
+    aboveskip=8pt, belowskip=8pt
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{TP02 v2 --- Secure Messaging}   % FIX: --- instead of Unicode em dash —
+\lhead{Denis Ozdemir --- ICE3 ENSIBS} % FIX: idem
+\rfoot{\thepage}
+
+\titleformat{\section}{\large\bfseries}{{\S}\,\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\title{%
+  \vspace{-1cm}
+  \textbf{Advanced Secure Messaging}\\[6pt]
+  \large AES-GCM $\cdot$ RSA-PSS Signatures $\cdot$ Multi-session $\cdot$ Audit Log
+  % FIX: $\cdot$ instead of Unicode middle dot ·  (U+00B7, not in base T1 mapping)
+}
+\author{Denis O.}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{Objective and Scope}
+
+Version~2 extends the baseline v1 system with production-grade security properties:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Authenticated encryption}: AES-CBC (unauthenticated) is replaced by AES-GCM, which simultaneously encrypts and provides a 128-bit integrity tag --- preventing ciphertext tampering without a separate HMAC.
+  \item \textbf{Non-repudiation}: every outgoing message is signed with the sender's RSA private key (PSS/SHA-256). Recipients verify the signature against the sender's registered public key.
+  \item \textbf{Multi-session}: each client maintains a per-peer AES key dictionary instead of a single global variable, enabling simultaneous conversations.
+  \item \textbf{Server-side signature verification}: the server verifies the session-request signature before issuing a new AES key, preventing impersonation.
+  \item \textbf{Idempotent session management}: duplicate session requests return HTTP~409 rather than silently re-generating a key; a \texttt{/session/reset} endpoint allows intentional re-keying.
+  \item \textbf{Structured messages}: message payloads carry \texttt{text}, \texttt{timestamp}, \texttt{signature}, \texttt{sender}, and \texttt{session\_id} --- enabling richer UI and auditability.
+  \item \textbf{Audit log}: the server persists a timestamped log of all cryptographic events accessible via \texttt{GET /audit}.
+  \item \textbf{Modern UI}: a dark-mode interface with message timestamps, RSA-PSS verification badges, encryption summary panel, and toast notifications.
+\end{itemize}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{Architecture}
+
+\subsection{Component overview}
+
+\begin{center}
+\begin{tabular}{llp{8cm}}
+\toprule
+\textbf{Process} & \textbf{Port} & \textbf{Role} \\
+\midrule
+\texttt{server.py} & 5000 & Key distribution, signature verification, audit log \\
+\texttt{client.py} Alice & 5001 & Chat client, AES-GCM encrypt/decrypt, RSA-PSS sign/verify \\
+\texttt{client.py} Bob & 5002 & Chat client (same code, different port/username) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Full message flow}
+
+\begin{enumerate}[noitemsep]
+  \item Both clients generate RSA-2048 key pairs locally at startup.
+  \item Each client \texttt{POST /register} their public key with the server.
+  \item Alice calls \texttt{POST /session} with a PSS-signed proof-of-identity string \texttt{"Alice:Bob"}.
+  \item Server verifies the signature, generates a 16-byte AES key, encrypts it under each party's RSA public key, records the session in the audit log, and returns both ciphertexts.
+  \item Alice decrypts her copy; forwards Bob's RSA-wrapped copy (plus session ID) via peer-to-peer \texttt{POST /receive\_key}.
+  \item Alice composes message payload \(\{\texttt{text},\texttt{timestamp},\texttt{signature},\texttt{session\_id}\}\), signs the plaintext with RSA-PSS, serialises to JSON, and encrypts the whole JSON string with AES-GCM.
+  \item The AES-GCM blob is sent to Bob via \texttt{POST /receive\_message}.
+  \item Bob decrypts with AES-GCM (tag verification happens automatically), parses the JSON, fetches Alice's public key, and verifies the RSA-PSS signature.
+  \item Bob's UI displays the message with a green badge if verification succeeds.
+\end{enumerate}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{Cryptographic Details}
+
+\subsection{AES-GCM authenticated encryption}
+
+AES-128-GCM provides \emph{confidentiality} (via CTR-mode encryption) and \emph{integrity} (via GHASH authentication tag) in a single pass.  The 96-bit nonce is generated randomly for each message and prepended to the tag+ciphertext blob before base64 encoding.
+
+\[
+  \text{blob} = \underbrace{\text{nonce}}_{16\,\text{B}} \;\|\;
+                \underbrace{\text{tag}}_{16\,\text{B}} \;\|\;
+                \underbrace{\text{ciphertext}}_{|\text{plaintext}|\,\text{B}}
+\]
+
+\begin{lstlisting}
+def encrypt_gcm(plaintext: str, key: bytes) -> str:
+    cipher = AES.new(key, AES.MODE_GCM)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext.encode())
+    blob = cipher.nonce + tag + ciphertext
+    return base64.b64encode(blob).decode()
+\end{lstlisting}
+
+If the tag does not match on decryption, \texttt{decrypt\_and\_verify} raises \texttt{ValueError} --- the message is rejected before any plaintext is exposed.
+
+\subsection{RSA-PSS message signatures}
+
+Each message is signed over its plaintext with the sender's RSA-2048 private key using the PSS scheme and SHA-256:
+
+\begin{lstlisting}
+def sign_message(text: str) -> str:
+    h   = SHA256.new(text.encode())
+    sig = pss.new(my_key).sign(h)
+    return base64.b64encode(sig).decode()
+\end{lstlisting}
+
+The signature is embedded in the JSON payload \emph{before} encryption, so only the intended recipient (who decrypts successfully) can read and verify it.
+
+\subsection{Server-side session-request signature}
+
+Before issuing an AES session key, the server verifies that the claimed initiator signed the string \(\texttt{"initiator:target"}\):
+
+\begin{lstlisting}
+verifier = pss.new(RSA.import_key(clients_db[initiator]["public_key"]))
+h        = SHA256.new(f"{initiator}:{target}".encode())
+verifier.verify(h, base64.b64decode(sig_b64))   # raises on failure
+\end{lstlisting}
+
+This ensures the server does not issue session keys to an entity that cannot prove ownership of the registered private key.
+
+\subsection{Comparison: v1 vs v2}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Property} & \textbf{v1} & \textbf{v2} \\
+\midrule
+Symmetric cipher     & AES-128-CBC          & AES-128-GCM \\
+Integrity            & None (unauthenticated) & 128-bit GCM tag \\
+Message signatures   & None                 & RSA-2048 PSS/SHA-256 \\
+Session-req.\ authN  & None                 & RSA-PSS proof-of-identity \\
+Multi-session        & No (global variable) & Yes (per-peer dict) \\
+Idempotent sessions  & No                   & Yes (HTTP 409 + reset) \\
+Structured messages  & Plain strings        & JSON with timestamp + sig \\
+Audit log            & None                 & Timestamped server-side log \\
+HTTP error codes     & 200 for errors       & 400 / 403 / 404 / 409 \\
+UI                   & Basic light theme    & Dark theme + sig badges + status \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{API Reference}
+
+\subsection{Server endpoints}
+
+\begin{center}
+\begin{tabular}{llp{8cm}}
+\toprule
+Method & Route & Description \\
+\midrule
+GET  & \texttt{/}                         & Health check + server stats \\
+POST & \texttt{/register}                 & Register username + RSA public key \\
+GET  & \texttt{/users}                    & List all registered clients \\
+POST & \texttt{/session}                  & Issue AES session key (with signature verification) \\
+POST & \texttt{/session/reset}            & Force-delete a session between two users \\
+GET  & \texttt{/session\_info/<id>}       & Return session metadata \\
+GET  & \texttt{/audit}                    & Return full audit event log \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Client endpoints}
+
+\begin{center}
+\begin{tabular}{llp{7cm}}
+\toprule
+Method & Route & Description \\
+\midrule
+GET  & \texttt{/}                  & Serve the v2 chat UI \\
+POST & \texttt{/send}              & Sign, encrypt (GCM), forward message \\
+POST & \texttt{/receive\_key}      & Receive RSA-wrapped AES key \\
+POST & \texttt{/receive\_key\_v2}  & Extended: also caches sender's public key \\
+POST & \texttt{/receive\_message}  & Decrypt (GCM), verify signature, store \\
+GET  & \texttt{/messages}          & Return history (\texttt{?peer=X} to filter) \\
+GET  & \texttt{/status}            & Expose active sessions + message counts \\
+POST & \texttt{/reset\_session}    & Clear local AES key for a peer \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{How to Run}
+
+\begin{lstlisting}[language=bash, basicstyle=\ttfamily\small\color{codefg}]
+# Terminal 1 - key server
+python server.py
+
+# Terminal 2 - Alice
+python client.py 5001 Alice
+
+# Terminal 3 - Bob
+python client.py 5002 Bob
+\end{lstlisting}
+
+Open \url{http://127.0.0.1:5001} and \url{http://127.0.0.1:5002} in two browser tabs. The UI auto-configures the target peer.
+
+To inspect the server audit log:
+\begin{lstlisting}[language=bash, basicstyle=\ttfamily\small\color{codefg}]
+curl http://127.0.0.1:5000/audit
+\end{lstlisting}
+% FIX: removed Markdown link syntax [url](url) — inside lstlisting it breaks intent
+
+To view client session status:
+\begin{lstlisting}[language=bash, basicstyle=\ttfamily\small\color{codefg}]
+curl http://127.0.0.1:5001/status
+\end{lstlisting}
+% FIX: idem
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{Design Notes and Remaining Limitations}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Server trust}: The server still sees the AES key in plaintext at generation time. A Diffie--Hellman or ECDH key agreement would eliminate this.
+  \item \textbf{No TLS}: HTTP transport is unencrypted. Production deployment requires HTTPS.
+  \item \textbf{Public key retrieval}: Signature verification relies on fetching the sender's public key from the server via \texttt{GET /users}. In a real system this should be done over a separate authenticated channel, or keys should be certified by a CA.
+  \item \textbf{Replay attacks}: messages carry a timestamp but there is no nonce registry to detect replays. Adding a per-session message counter would address this.
+  \item \textbf{In-memory storage}: all state is lost on restart. A real deployment would persist sessions and message history in a database.
+\end{itemize}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{Possible Extensions}
+
+\begin{itemize}[noitemsep]
+  \item Replace server AES distribution with an ECDH key agreement (zero server trust).
+  \item Add TLS to all Flask endpoints (\texttt{ssl\_context} in \texttt{app.run}).
+  \item Implement a replay-prevention nonce registry.
+  \item Persist sessions and history to SQLite.
+  \item Group chat support (one AES key per group, distributed to \(n\) members).
+\end{itemize}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\section{References}
+
+\begin{itemize}[noitemsep]
+  \item NIST SP 800-38D --- Galois/Counter Mode (GCM): \url{https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf}
+  \item PKCS \#1 v2.2 / RSA-PSS --- RFC 8017: \url{https://datatracker.ietf.org/doc/html/rfc8017}
+  \item PyCryptodome documentation: \url{https://pycryptodome.readthedocs.io}
+  \item Flask documentation: \url{https://flask.palletsprojects.com}
+\end{itemize}
+
+\end{document}
